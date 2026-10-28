@@ -44,6 +44,13 @@
               <option :value="800">800 (densest)</option>
             </select>
           </div>
+          <div class="text-sm mb-3">
+            Compression:
+            <select v-model.number="quality" class="border border-gray-500">
+              <option :value="9">Fast (~3s, ~10% smaller than gzip)</option>
+              <option :value="11">Max (~40s, page freezes, ~20% smaller)</option>
+            </select>
+          </div>
           <label class="text-sm mb-3 block">
             <input type="checkbox" v-model="repair_only" />
             Resume: send repair frames only (receiver kept its progress)
@@ -81,6 +88,7 @@
           const fps = ref(10);
           const block_size = ref(400);
           const repair_only = ref(false);
+          const quality = ref(9);
           const meta_every = 50;
           let qrcode_object = "";
 
@@ -115,11 +123,11 @@
           };
 
           // Brotli (wasm, bundled in lib/) with gzip as a fallback.
-          const compress = async (input) => {
+          const compress = async (input, level) => {
             try {
               const brotli = await import("./lib/brotli/brotli_wasm.js");
               await brotli.default();
-              return { comp: "br", data: brotli.compress(input, { quality: 11 }) };
+              return { comp: "br", data: brotli.compress(input, { quality: level }) };
             } catch (error) {
               console.error("Brotli unavailable, using gzip", error);
               return { comp: "gz", data: pako.gzip(input, { level: 9 }) };
@@ -142,11 +150,14 @@
               return;
             }
             is_transferring.value = true;
-            user_message.value = "Compressing with Brotli (large files take up to ~1 min) ...";
+            user_message.value =
+              quality.value >= 11
+                ? "Compressing (Max): the page will look frozen for ~40s, please wait ..."
+                : "Compressing ...";
             await sleep(50);
 
             const original = new Uint8Array(await file.arrayBuffer());
-            const { comp, data } = await compress(original);
+            const { comp, data } = await compress(original, quality.value);
             const B = block_size.value;
             const K = Math.ceil(data.length / B);
             const padded = new Uint8Array(K * B);
@@ -215,6 +226,7 @@
             fps,
             block_size,
             repair_only,
+            quality,
           };
         },
       }).mount("#app");
