@@ -12,28 +12,52 @@
       <div
         class="flex flex-col items-start w-full items-center justify-center align-middle"
       >
-        <div class="text-xl my-4">Data Receiver Mode</div>
-        <div class="text-sm mb-4">{{user_message}}</div>
-        <div class="text-sm mb-4">
+        <div class="text-xl my-2">Data Receiver Mode</div>
+        <div class="text-sm mb-2 px-2 text-center">{{user_message}}</div>
+        <div class="text-sm mb-2">
           Progress: {{received}} / {{file_metadata.chunks || 0}}
           <span v-if="file_metadata.chunks">
             ({{file_metadata.chunks - received}} missing)
           </span>
         </div>
-        <button
-          v-if="!is_receiving"
-          v-on:click="start_receiver"
-          class="mb-6 p-1 border-2 border-gray-500"
-        >
-          Start Receiver
-        </button>
-        <button
-          v-else
-          v-on:click="stop_receiver"
-          class="mb-6 p-1 border-2 border-gray-500"
-        >
-          Stop Receiver
-        </button>
+        <div v-if="batch_status.length" class="text-sm mb-1">
+          Next batch to scan: <b>{{next_batch}}</b> (sender: set Batch =
+          {{next_batch}})
+        </div>
+        <div class="flex flex-wrap justify-center gap-1 mb-3 px-2">
+          <div
+            v-for="b in batch_status"
+            :key="b.n"
+            class="text-xs text-center border border-gray-400 px-1"
+            style="min-width: 2.4rem"
+            :class="b.done ? 'bg-green-400' : (b.have ? 'bg-yellow-200' : 'bg-gray-100')"
+          >
+            {{b.n}}<br />{{b.have}}/{{b.size}}
+          </div>
+        </div>
+        <div class="flex flex-row gap-2 mb-3">
+          <button
+            v-if="!is_receiving"
+            v-on:click="start_receiver"
+            class="p-1 border-2 border-gray-500"
+          >
+            {{received ? 'Resume' : 'Start Receiver'}}
+          </button>
+          <button
+            v-else
+            v-on:click="stop_receiver"
+            class="p-1 border-2 border-gray-500"
+          >
+            Pause (progress is saved)
+          </button>
+          <button
+            v-if="received"
+            v-on:click="reset_all"
+            class="p-1 border-2 border-red-400"
+          >
+            Reset
+          </button>
+        </div>
         <video id="videoElement" muted autoplay playsinline></video>
       </div>
     </div>
@@ -41,11 +65,11 @@
     <script src="https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@latest/dist/index.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
     <script>
-      const { createApp, ref, reactive, onMounted } = Vue;
+      const { createApp, ref, reactive, computed, onMounted } = Vue;
 
       createApp({
         setup() {
-          const idle_message = "Click receive button to start receiving";
+          const idle_message = "Click Start Receiver, then point at the sender";
           const user_message = ref(idle_message);
           const received = ref(0);
           const file_metadata = reactive({});
@@ -53,7 +77,105 @@
           // Plain Map (not reactive): index -> Uint8Array
           let chunks = new Map();
           let current_id = null;
-          let canvas, context, videoElement;
+          let canvas, context, videoElement, audio_context;
+
+          // ---- persistence (IndexedDB for chunks, localStorage for meta) ----
+          let db = null;
+          const db_open = () =>
+            new Promise((resolve) => {
+              try {
+                const req = indexedDB.open("qr_transfer", 1);
+                req.onupgradeneeded = () =>
+                  req.result.createObjectStore("chunks");
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(null);
+              } catch (e) {
+                resolve(null);
+              }
+            });
+          const db_put = (key, value) => {
+            if (!db) return;
+            try {
+              db.transaction("chunks", "readwrite")
+                .objectStore("chunks")
+                .put(value, key);
+            } catch (e) {}
+          };
+          const prefix_range = (id) =>
+            IDBKeyRange.bound(id + ":", id + ":￿");
+          const db_load = (id) =>
+            new Promise((resolve) => {
+              const out = new Map();
+              if (!db) return resolve(out);
+              try {
+                const req = db
+                  .transaction("chunks")
+                  .objectStore("chunks")
+                  .openCursor(prefix_range(id));
+                req.onsuccess = () => {
+                  const cursor = req.result;
+                  if (cursor) {
+                    out.set(parseInt(cursor.key.split(":")[1]), cursor.value);
+                    cursor.continue();
+                  } else {
+                    resolve(out);
+                  }
+                };
+                req.onerror = () => resolve(out);
+              } catch (e) {
+                resolve(out);
+              }
+            });
+          const db_clear = (id) => {
+            if (!db) return;
+            try {
+              db.transaction("chunks", "readwrite")
+                .objectStore("chunks")
+                .delete(prefix_range(id));
+            } catch (e) {}
+          };
+          const save_meta = (meta) => {
+            try {
+              localStorage.setItem("qr_last_meta", JSON.stringify(meta));
+            } catch (e) {}
+          };
+          const clear_meta = () => {
+            try {
+              localStorage.removeItem("qr_last_meta");
+            } catch (e) {}
+          };
+
+          // ---- batch view ----
+          const batch_size = () => file_metadata.batch || 200;
+          const batch_status = computed(() => {
+            received.value; // re-evaluate whenever a chunk arrives
+            const total = file_metadata.chunks || 0;
+            const size = batch_size();
+            const out = [];
+            for (let b = 0; b * size < total; b++) {
+              const from = b * size;
+              const to = Math.min(from + size, total);
+              let have = 0;
+              for (let i = from; i < to; i++) if (chunks.has(i)) have++;
+              out.push({ n: b + 1, have, size: to - from, done: have === to - from });
+            }
+            return out;
+          });
+          const next_batch = computed(() => {
+            const open = batch_status.value.find((b) => !b.done);
+            return open ? open.n : "-";
+          });
+
+          const beep = () => {
+            try {
+              audio_context = audio_context || new AudioContext();
+              const osc = audio_context.createOscillator();
+              osc.connect(audio_context.destination);
+              osc.frequency.value = 880;
+              osc.start();
+              osc.stop(audio_context.currentTime + 0.25);
+            } catch (e) {}
+          };
 
           const b64_to_bytes = (b64) => {
             const binary = atob(b64);
@@ -83,8 +205,16 @@
             setTimeout(() => URL.revokeObjectURL(url), 10000);
           };
 
+          // Pause: keep everything (it is saved), just stop scanning.
           const stop_receiver = () => {
             is_receiving.value = false;
+            user_message.value = "Paused - progress saved. Press Resume later.";
+          };
+
+          const reset_all = () => {
+            is_receiving.value = false;
+            if (current_id) db_clear(current_id);
+            clear_meta();
             reset_state();
             user_message.value = idle_message;
           };
@@ -96,38 +226,98 @@
                 : requestAnimationFrame(() => r())
             );
 
-          const handle_symbol = (text) => {
+          const handle_symbol = async (text) => {
             if (text.charAt(0) === "{") {
               const meta = JSON.parse(text);
               if (meta.id !== current_id) {
-                // New transfer: reset progress. The same meta repeating
-                // while looping must NOT wipe what we already have.
-                chunks = new Map();
-                received.value = 0;
+                // New (or different) transfer: load whatever was saved for
+                // it. The same meta repeating must NOT wipe what we have.
                 current_id = meta.id;
+                chunks = await db_load(meta.id);
+                received.value = chunks.size;
               }
+              if (file_metadata.chunks !== meta.chunks) save_meta(meta);
               Object.assign(file_metadata, meta);
-              user_message.value = `Transferring file: ${meta.name}`;
+              if (is_receiving.value) {
+                user_message.value = `Receiving: ${meta.name}`;
+              }
               return;
             }
             const parts = text.split("|");
             if (parts.length !== 3) return;
             const [id, index, b64] = parts;
-            if (current_id === null) current_id = id;
+            if (current_id === null) {
+              current_id = id;
+              chunks = await db_load(id);
+              received.value = chunks.size;
+            }
             if (id !== current_id) return;
             const i = parseInt(index);
             if (chunks.has(i)) return;
-            chunks.set(i, b64_to_bytes(b64));
+            const bytes = b64_to_bytes(b64);
+            chunks.set(i, bytes);
+            db_put(id + ":" + i, bytes);
             received.value = chunks.size;
+
+            const size = batch_size();
+            const b = Math.floor(i / size);
+            const from = b * size;
+            const to = Math.min(from + size, file_metadata.chunks || Infinity);
+            let done = true;
+            for (let k = from; k < to; k++) {
+              if (!chunks.has(k)) {
+                done = false;
+                break;
+              }
+            }
+            if (done && file_metadata.chunks && chunks.size < file_metadata.chunks) {
+              beep();
+              user_message.value = `Batch ${b + 1} done! Set the sender to batch ${next_batch.value}. (Pause anytime - progress is saved)`;
+            }
           };
 
           const is_complete = () =>
             file_metadata.chunks && chunks.size >= file_metadata.chunks;
 
+          const finish = () => {
+            let total = 0;
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              total += chunks.get(i).length;
+            }
+            const joined = new Uint8Array(total);
+            let offset = 0;
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              joined.set(chunks.get(i), offset);
+              offset += chunks.get(i).length;
+            }
+            try {
+              const inflated = pako.inflate(joined);
+              download_file(inflated, file_metadata.name);
+              user_message.value = "Data Transfer Complete";
+              beep();
+              db_clear(current_id);
+              clear_meta();
+              is_receiving.value = false;
+              chunks = new Map();
+              received.value = 0;
+              current_id = null;
+            } catch (error) {
+              console.error(error);
+              user_message.value =
+                "Data is corrupted. Press Reset and scan again.";
+              is_receiving.value = false;
+            }
+          };
+
           const start_receiver = async () => {
-            reset_state();
             is_receiving.value = true;
-            user_message.value = "Point the camera at the sender's screen";
+            audio_context = audio_context || null;
+            try {
+              audio_context = audio_context || new AudioContext(); // unlock on click
+            } catch (e) {}
+            user_message.value = received.value
+              ? "Resumed - point the camera at the sender's screen"
+              : "Point the camera at the sender's screen";
             while (is_receiving.value && !is_complete()) {
               try {
                 await next_frame();
@@ -148,37 +338,36 @@
                 );
                 const symbols = await zbarWasm.scanImageData(image_data);
                 if (!symbols || !symbols.length) continue;
-                handle_symbol(symbols[0].decode());
+                await handle_symbol(symbols[0].decode());
               } catch (error) {
                 console.error("Error in Loop: ", error);
               }
             }
-            if (!is_receiving.value) return;
-
-            user_message.value = "Data Transfer Complete";
-            let total = 0;
-            for (let i = 0; i < file_metadata.chunks; i++) {
-              total += chunks.get(i).length;
-            }
-            const joined = new Uint8Array(total);
-            let offset = 0;
-            for (let i = 0; i < file_metadata.chunks; i++) {
-              joined.set(chunks.get(i), offset);
-              offset += chunks.get(i).length;
-            }
-            const inflated = pako.inflate(joined);
-            download_file(inflated, file_metadata.name);
-            is_receiving.value = false;
+            if (is_receiving.value && is_complete()) finish();
           };
 
           onMounted(async () => {
             console.log("Application Initialized ...");
+            db = await db_open();
+            // Restore an interrupted transfer
+            try {
+              const saved = JSON.parse(localStorage.getItem("qr_last_meta"));
+              if (saved && saved.id) {
+                current_id = saved.id;
+                chunks = await db_load(saved.id);
+                Object.assign(file_metadata, saved);
+                received.value = chunks.size;
+                if (chunks.size) {
+                  user_message.value = `Saved progress found for ${saved.name}. Press Resume.`;
+                }
+              }
+            } catch (e) {}
             videoElement = document.getElementById("videoElement");
             videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
               video: {
                 facingMode: "environment",
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
               },
             });
             canvas = document.createElement("canvas");
@@ -192,6 +381,9 @@
             file_metadata,
             received,
             stop_receiver,
+            reset_all,
+            batch_status,
+            next_batch,
           };
         },
       }).mount("#app");
