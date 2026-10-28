@@ -309,7 +309,33 @@
             }
           };
 
+          const start_camera = async () => {
+            if (videoElement.srcObject) return true;
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+              user_message.value =
+                "This browser cannot use the camera. Open the link in Safari (not inside Zalo) over https.";
+              return false;
+            }
+            try {
+              videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
+                video: {
+                  facingMode: "environment",
+                  width: { ideal: 1920 },
+                  height: { ideal: 1080 },
+                },
+              });
+              await videoElement.play();
+              return true;
+            } catch (error) {
+              console.error(error);
+              user_message.value = `Camera error: ${error.name}. Allow camera access (or open in Safari, not in Zalo) and try again.`;
+              return false;
+            }
+          };
+
           const start_receiver = async () => {
+            user_message.value = "Starting camera ...";
+            if (!(await start_camera())) return;
             is_receiving.value = true;
             audio_context = audio_context || null;
             try {
@@ -348,6 +374,9 @@
 
           onMounted(async () => {
             console.log("Application Initialized ...");
+            videoElement = document.getElementById("videoElement");
+            canvas = document.createElement("canvas");
+            context = canvas.getContext("2d", { willReadFrequently: true });
             db = await db_open();
             // Restore an interrupted transfer
             try {
@@ -362,16 +391,6 @@
                 }
               }
             } catch (e) {}
-            videoElement = document.getElementById("videoElement");
-            videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
-              video: {
-                facingMode: "environment",
-                width: { ideal: 1920 },
-                height: { ideal: 1080 },
-              },
-            });
-            canvas = document.createElement("canvas");
-            context = canvas.getContext("2d", { willReadFrequently: true });
           });
 
           return {
