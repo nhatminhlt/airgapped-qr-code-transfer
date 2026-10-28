@@ -30,28 +30,24 @@
               <option :value="5">5 frames/s (safest)</option>
               <option :value="8">8 frames/s</option>
               <option :value="10">10 frames/s</option>
+              <option :value="12">12 frames/s</option>
               <option :value="15">15 frames/s</option>
               <option :value="20">20 frames/s (fastest)</option>
             </select>
           </div>
           <div class="text-sm mb-3">
-            Batch (200 chunks each, 0 = all):
-            <div class="flex flex-row items-center gap-1 mt-1">
-              <button class="px-2 border-2 border-gray-500" v-on:click="prev_batch">
-                &#9664;
-              </button>
-              <input
-                type="number"
-                min="0"
-                v-model.number="batch"
-                class="w-16 border border-gray-500 text-center"
-              />
-              <button class="px-2 border-2 border-gray-500" v-on:click="next_batch">
-                &#9654;
-              </button>
-              <span v-if="total_batches">/ {{total_batches}}</span>
-            </div>
+            Bytes per QR:
+            <select v-model.number="block_size" class="border border-gray-500">
+              <option :value="300">300 (easiest to scan)</option>
+              <option :value="400">400</option>
+              <option :value="600">600</option>
+              <option :value="800">800 (densest)</option>
+            </select>
           </div>
+          <label class="text-sm mb-3 block">
+            <input type="checkbox" v-model="repair_only" />
+            Resume: send repair frames only (receiver kept its progress)
+          </label>
           <button
             v-if="!is_transferring"
             v-on:click="start_transfer"
@@ -73,6 +69,7 @@
     <script src="lib/vue.global.prod.js"></script>
     <script src="lib/qrcode.min.js"></script>
     <script src="lib/pako.min.js"></script>
+    <script src="lib/fountain.js"></script>
     <script>
       const { createApp, ref, onMounted } = Vue;
 
@@ -82,11 +79,8 @@
           const user_message = ref(idle_message);
           const is_transferring = ref(false);
           const fps = ref(10);
-          const batch = ref(0); // 0 = loop all chunks, n = only batch n (1-based)
-          const total_batches = ref(0);
-          // Raw bytes per QR. Base64 grows it by 4/3, so ~536 chars at level L.
-          const chunk_size = 400;
-          const batch_size = 200;
+          const block_size = ref(400);
+          const repair_only = ref(false);
           const meta_every = 50;
           let qrcode_object = "";
 
@@ -109,8 +103,6 @@
             return (c ^ 0xffffffff) >>> 0;
           };
 
-          // Base64 straight from the bytes (no UTF-8 round trip, which
-          // inflated every byte >= 128 into two bytes).
           const bytes_to_b64 = (bytes) => {
             let binary = "";
             for (let i = 0; i < bytes.length; i += 0x8000) {
@@ -122,31 +114,21 @@
             return btoa(binary);
           };
 
-          const shuffled = (n) => {
-            const order = Array.from({ length: n }, (_, i) => i);
-            for (let i = n - 1; i > 0; i--) {
-              const j = Math.floor(Math.random() * (i + 1));
-              [order[i], order[j]] = [order[j], order[i]];
+          // Brotli (wasm, bundled in lib/) with gzip as a fallback.
+          const compress = async (input) => {
+            try {
+              const brotli = await import("./lib/brotli/brotli_wasm.js");
+              await brotli.default();
+              return { comp: "br", data: brotli.compress(input, { quality: 11 }) };
+            } catch (error) {
+              console.error("Brotli unavailable, using gzip", error);
+              return { comp: "gz", data: pako.gzip(input, { level: 9 }) };
             }
-            return order;
           };
 
           const show_qr = (text) => {
             qrcode_object.clear();
             qrcode_object.makeCode(text);
-          };
-
-          const clamp_batch = () => {
-            const b = Math.floor(Number(batch.value)) || 0;
-            const max = total_batches.value || Infinity;
-            return Math.min(Math.max(b, 0), max);
-          };
-          const prev_batch = () => {
-            batch.value = Math.max(clamp_batch() - 1, 0);
-          };
-          const next_batch = () => {
-            batch.value = clamp_batch() + 1;
-            batch.value = clamp_batch();
           };
 
           const stop_transfer = () => {
@@ -160,73 +142,51 @@
               return;
             }
             is_transferring.value = true;
-            user_message.value = "Compressing file ...";
-            await sleep(20);
+            user_message.value = "Compressing with Brotli (large files take up to ~1 min) ...";
+            await sleep(50);
 
-            const data_array = pako.gzip(
-              new Uint8Array(await file.arrayBuffer()),
-              { level: 9 }
-            );
-            const total_chunks = Math.ceil(data_array.length / chunk_size);
-            total_batches.value = Math.ceil(total_chunks / batch_size);
+            const original = new Uint8Array(await file.arrayBuffer());
+            const { comp, data } = await compress(original);
+            const B = block_size.value;
+            const K = Math.ceil(data.length / B);
+            const padded = new Uint8Array(K * B);
+            padded.set(data);
             // Same file => same id, so the receiver can resume after a break.
-            const transfer_id = crc32(data_array).toString(36);
+            const transfer_id = crc32(data).toString(36);
+            const idh = Fountain.idhash(transfer_id);
             const meta_text = JSON.stringify({
               id: transfer_id,
               name: file.name,
-              chunks: total_chunks,
-              batch: batch_size,
+              len: data.length,
+              K,
+              B,
+              comp,
             });
-            // Pre-encode every frame once: id|index|base64
-            const frames = new Array(total_chunks);
-            for (let i = 0; i < total_chunks; i++) {
-              const start = i * chunk_size;
-              frames[i] =
-                transfer_id +
-                "|" +
-                i +
-                "|" +
-                bytes_to_b64(data_array.subarray(start, start + chunk_size));
-            }
-            batch.value = clamp_batch();
+            const kb = (n) => Math.round(n / 1024);
+            const info = `${kb(original.length)}KB -> ${kb(data.length)}KB (${comp}), ${K} blocks`;
 
             show_qr(meta_text);
-            user_message.value = "Starting data transfer in few seconds ...";
+            user_message.value = `${info}. Starting in few seconds ...`;
             await sleep(1500);
 
-            // Loop the selected batch until stopped (or the batch is
-            // changed): a chunk the camera missed comes around again. After
-            // the first pass the order is shuffled so a chunk is not stuck in
-            // the same phase as the camera frame rate.
-            let cycle = 0;
-            let active = -1;
+            // Endless stream: seeds 0..K-1 are the plain blocks, everything
+            // after is a repair symbol. The receiver needs about K symbols in
+            // total, whichever ones it manages to catch.
+            let seed = repair_only.value ? K + Math.floor(Math.random() * 1e6) : 0;
+            let sent = 0;
             while (is_transferring.value) {
-              const b = clamp_batch();
-              if (b !== active) {
-                active = b;
-                cycle = 0;
-              }
-              const from = b === 0 ? 0 : (b - 1) * batch_size;
-              const to =
-                b === 0 ? total_chunks : Math.min(b * batch_size, total_chunks);
-              const count = to - from;
-              const order =
-                cycle === 0
-                  ? Array.from({ length: count }, (_, i) => i)
-                  : shuffled(count);
-              for (let k = 0; k < count; k++) {
-                if (!is_transferring.value || clamp_batch() !== active) break;
-                if (k % meta_every === 0) {
-                  show_qr(meta_text);
-                  await sleep(1000 / fps.value);
-                }
-                show_qr(frames[from + order[k]]);
-                user_message.value = `${
-                  b === 0 ? "All" : `Batch ${b}/${total_batches.value}`
-                } · pass ${cycle + 1} · chunk ${k + 1}/${count}`;
+              if (sent % meta_every === 0) {
+                show_qr(meta_text);
                 await sleep(1000 / fps.value);
               }
-              cycle++;
+              const symbol = Fountain.encode(padded, K, B, idh, seed);
+              show_qr(transfer_id + "|" + seed + "|" + bytes_to_b64(symbol));
+              sent++;
+              seed++;
+              user_message.value = `${info} · frame ${sent} (${Math.round(
+                (sent / K) * 100
+              )}% of ${K}) - press Stop when the receiver is done`;
+              await sleep(1000 / fps.value);
             }
 
             show_qr(idle_message);
@@ -253,10 +213,8 @@
             stop_transfer,
             is_transferring,
             fps,
-            batch,
-            total_batches,
-            prev_batch,
-            next_batch,
+            block_size,
+            repair_only,
           };
         },
       }).mount("#app");
