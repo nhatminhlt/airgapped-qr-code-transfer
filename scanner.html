@@ -15,8 +15,10 @@
         <div class="text-xl my-4">Data Receiver Mode</div>
         <div class="text-sm mb-4">{{user_message}}</div>
         <div class="text-sm mb-4">
-          Progress: {{Object.keys(decoded_chunks).length}} /
-          {{file_metadata.chunks || 0}}
+          Progress: {{received}} / {{file_metadata.chunks || 0}}
+          <span v-if="file_metadata.chunks">
+            ({{file_metadata.chunks - received}} missing)
+          </span>
         </div>
         <button
           v-if="!is_receiving"
@@ -39,33 +41,36 @@
     <script src="https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@latest/dist/index.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
     <script>
-      const { createApp, ref, reactive, onMounted, computed } = Vue;
+      const { createApp, ref, reactive, onMounted } = Vue;
 
       createApp({
         setup() {
-          const user_message = ref("Click receive button to start receiving");
-          const decoded_chunks = ref({});
-          const total_chunks = ref(-1);
+          const idle_message = "Click receive button to start receiving";
+          const user_message = ref(idle_message);
+          const received = ref(0);
           const file_metadata = reactive({});
           const is_receiving = ref(false);
+          // Plain Map (not reactive): index -> Uint8Array
+          let chunks = new Map();
+          let current_id = null;
           let canvas, context, videoElement;
 
-          const decode_data = (input_string) => {
-            const encoded_data = atob(input_string.split(",")[1]);
-            const encoded_array = Array.from(encoded_data, (char) =>
-              char.charCodeAt(0)
-            );
-            const utf8Decoder = new TextDecoder();
-            const output_string = utf8Decoder.decode(
-              new Uint8Array(encoded_array)
-            );
-            const data_array = Array.from(output_string, (char) =>
-              char.charCodeAt(0)
-            );
-            return {
-              index: parseInt(input_string.split(",")[0]),
-              data: data_array,
-            };
+          const b64_to_bytes = (b64) => {
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              bytes[i] = binary.charCodeAt(i);
+            }
+            return bytes;
+          };
+
+          const reset_state = () => {
+            chunks = new Map();
+            received.value = 0;
+            current_id = null;
+            for (const key of Object.keys(file_metadata)) {
+              delete file_metadata[key];
+            }
           };
 
           const download_file = (data, fileName) => {
@@ -75,79 +80,109 @@
             dummy_element.href = url;
             dummy_element.download = fileName;
             dummy_element.click();
-            URL.revokeObjectURL(url);
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
           };
 
           const stop_receiver = () => {
             is_receiving.value = false;
-            decoded_chunks.value = {};
-            Object.assign(file_metadata, {});
-            user_message.value = "Click receive button to start receiving";
+            reset_state();
+            user_message.value = idle_message;
           };
 
+          const next_frame = () =>
+            new Promise((r) =>
+              "requestVideoFrameCallback" in videoElement
+                ? videoElement.requestVideoFrameCallback(() => r())
+                : requestAnimationFrame(() => r())
+            );
+
+          const handle_symbol = (text) => {
+            if (text.charAt(0) === "{") {
+              const meta = JSON.parse(text);
+              if (meta.id !== current_id) {
+                // New transfer: reset progress. The same meta repeating
+                // while looping must NOT wipe what we already have.
+                chunks = new Map();
+                received.value = 0;
+                current_id = meta.id;
+              }
+              Object.assign(file_metadata, meta);
+              user_message.value = `Transferring file: ${meta.name}`;
+              return;
+            }
+            const parts = text.split("|");
+            if (parts.length !== 3) return;
+            const [id, index, b64] = parts;
+            if (current_id === null) current_id = id;
+            if (id !== current_id) return;
+            const i = parseInt(index);
+            if (chunks.has(i)) return;
+            chunks.set(i, b64_to_bytes(b64));
+            received.value = chunks.size;
+          };
+
+          const is_complete = () =>
+            file_metadata.chunks && chunks.size >= file_metadata.chunks;
+
           const start_receiver = async () => {
-            decoded_chunks.value = {};
+            reset_state();
             is_receiving.value = true;
-            while (
-              file_metadata.chunks != Object.keys(decoded_chunks.value).length
-            ) {
+            user_message.value = "Point the camera at the sender's screen";
+            while (is_receiving.value && !is_complete()) {
               try {
-                await new Promise((r) => setTimeout(r, 10));
+                await next_frame();
+                if (
+                  canvas.width !== videoElement.videoWidth ||
+                  canvas.height !== videoElement.videoHeight
+                ) {
+                  canvas.width = videoElement.videoWidth;
+                  canvas.height = videoElement.videoHeight;
+                }
+                if (!canvas.width) continue;
                 context.drawImage(videoElement, 0, 0);
-                image_data = context.getImageData(
+                const image_data = context.getImageData(
                   0,
                   0,
                   canvas.width,
                   canvas.height
                 );
-                let symbols = await zbarWasm.scanImageData(image_data);
-                if (!symbols || !symbols.length) {
-                  continue;
-                }
-                let decoded_data = symbols[0].decode();
-                if (decoded_data.includes("chunks")) {
-                  Object.assign(file_metadata, JSON.parse(decoded_data));
-                  decoded_chunks.value = {};
-                  user_message.value = `Transferring file: ${file_metadata.name}`;
-                } else if (decoded_data.split(",").length == 2) {
-                  let raw_data = decode_data(decoded_data);
-                  decoded_chunks.value[raw_data["index"]] = raw_data["data"];
-                }
-                window.decoded_chunks = decoded_chunks.value;
+                const symbols = await zbarWasm.scanImageData(image_data);
+                if (!symbols || !symbols.length) continue;
+                handle_symbol(symbols[0].decode());
               } catch (error) {
                 console.error("Error in Loop: ", error);
               }
-              if (!is_receiving.value) {
-                Object.assign(file_metadata, {});
-                decoded_chunks.value = {};
-                user_message.value = "Click receive button to start receiving";
-                return true;
-              }
             }
+            if (!is_receiving.value) return;
+
             user_message.value = "Data Transfer Complete";
-            output_array = [];
+            let total = 0;
             for (let i = 0; i < file_metadata.chunks; i++) {
-              output_array = output_array.concat(decoded_chunks.value[i]);
+              total += chunks.get(i).length;
             }
-            let output_unit8array = Uint8Array.from(output_array);
-            window.output_unit8array = output_unit8array;
-            let infalted_array = pako.inflate(window.output_unit8array);
-            download_file(infalted_array, file_metadata.name);
-            stop_receiver();
+            const joined = new Uint8Array(total);
+            let offset = 0;
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              joined.set(chunks.get(i), offset);
+              offset += chunks.get(i).length;
+            }
+            const inflated = pako.inflate(joined);
+            download_file(inflated, file_metadata.name);
+            is_receiving.value = false;
           };
 
           onMounted(async () => {
             console.log("Application Initialized ...");
             videoElement = document.getElementById("videoElement");
             videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
-              video: { facingMode: "environment" },
+              video: {
+                facingMode: "environment",
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+              },
             });
             canvas = document.createElement("canvas");
-            context = canvas.getContext("2d");
-            await new Promise((r) => setTimeout(r, 2000));
-            canvas.height = videoElement.videoHeight;
-            canvas.width = videoElement.videoWidth;
-            context.drawImage(videoElement, 0, 0);
+            context = canvas.getContext("2d", { willReadFrequently: true });
           });
 
           return {
@@ -155,7 +190,7 @@
             start_receiver,
             is_receiving,
             file_metadata,
-            decoded_chunks,
+            received,
             stop_receiver,
           };
         },

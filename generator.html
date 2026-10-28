@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="X-UA-Compatible" content="ie=edge" />
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      #qrcode img,
+      #qrcode canvas {
+        image-rendering: pixelated;
+      }
+    </style>
   </head>
 
   <body>
@@ -20,6 +26,16 @@
             id="file_input"
             type="file"
           />
+        </div>
+        <div class="text-sm mb-4">
+          Speed:
+          <select v-model.number="fps" class="border border-gray-500">
+            <option :value="5">5 frames/s (safest)</option>
+            <option :value="8">8 frames/s</option>
+            <option :value="10">10 frames/s</option>
+            <option :value="15">15 frames/s</option>
+            <option :value="20">20 frames/s (fastest)</option>
+          </select>
         </div>
         <button
           v-if="!is_transferring"
@@ -46,68 +62,124 @@
 
       createApp({
         setup() {
-          const user_message = ref("Choose file to get started");
+          const idle_message = "Choose file to get started";
+          const user_message = ref(idle_message);
           const is_transferring = ref(false);
-          const chunk_size = 250;
+          const fps = ref(10);
+          // Raw bytes per QR. Base64 grows it by 4/3, so ~536 chars at level L.
+          const chunk_size = 400;
+          const meta_every = 100;
           let qrcode_object = "";
 
-          const encode_data = (index, input_bytes) => {
-            let encoded_string = String.fromCharCode.apply(null, input_bytes);
-            let utf8Encoder = new TextEncoder();
-            let utf8_bytes = utf8Encoder.encode(encoded_string);
-            let encoded_data = btoa(
-              String.fromCharCode.apply(null, utf8_bytes)
-            );
-            return index + "," + encoded_data;
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+          // Base64 straight from the bytes (no UTF-8 round trip, which
+          // inflated every byte >= 128 into two bytes).
+          const bytes_to_b64 = (bytes) => {
+            let binary = "";
+            for (let i = 0; i < bytes.length; i += 0x8000) {
+              binary += String.fromCharCode.apply(
+                null,
+                bytes.subarray(i, i + 0x8000)
+              );
+            }
+            return btoa(binary);
+          };
+
+          const shuffled = (n) => {
+            const order = Array.from({ length: n }, (_, i) => i);
+            for (let i = n - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [order[i], order[j]] = [order[j], order[i]];
+            }
+            return order;
+          };
+
+          const show_qr = (text) => {
+            qrcode_object.clear();
+            qrcode_object.makeCode(text);
           };
 
           const stop_transfer = () => {
             is_transferring.value = false;
-            user_message.value = "Choose file to get started";
           };
 
           const start_transfer = async () => {
-            let file_input = document.getElementById("file_input");
-            is_transferring.value = true;
-            let file = file_input.files[0];
-            let data_chunks = [];
-            let data_array = pako.gzip(await file.arrayBuffer(), { level: 9 });
-            let total_chunks = Math.ceil(data_array.length / chunk_size);
-            let file_metadata = { name: file.name, chunks: total_chunks };
-            qrcode_object.clear();
-            qrcode_object.makeCode(JSON.stringify(file_metadata));
-            user_message.value = "Starting data transfer in few seconds ...";
-            await new Promise((r) => setTimeout(r, 1000));
-            for (let i = 0; i < total_chunks; i++) {
-              await new Promise((r) => setTimeout(r, 50));
-              let start = i * chunk_size;
-              let chunk = data_array.subarray(start, start + chunk_size);
-              let encoded_data = encode_data(i, chunk);
-              qrcode_object.clear();
-              qrcode_object.makeCode(encoded_data);
-              user_message.value = `Transfering Chunk ${i}/${total_chunks} ...`;
-              if (!is_transferring.value) {
-                user_message.value = "Choose file to get started";
-                qrcode_object.clear();
-                qrcode_object.makeCode("Choose file to get started");
-                break;
-              }
+            const file = document.getElementById("file_input").files[0];
+            if (!file) {
+              user_message.value = "Please choose a file first";
+              return;
             }
-            stop_transfer();
+            is_transferring.value = true;
+            user_message.value = "Compressing file ...";
+            await sleep(20);
+
+            const data_array = pako.gzip(
+              new Uint8Array(await file.arrayBuffer()),
+              { level: 9 }
+            );
+            const total_chunks = Math.ceil(data_array.length / chunk_size);
+            const transfer_id = Math.random().toString(36).slice(2, 6);
+            const meta_text = JSON.stringify({
+              id: transfer_id,
+              name: file.name,
+              chunks: total_chunks,
+            });
+            // Pre-encode every frame once: id|index|base64
+            const frames = new Array(total_chunks);
+            for (let i = 0; i < total_chunks; i++) {
+              const start = i * chunk_size;
+              frames[i] =
+                transfer_id +
+                "|" +
+                i +
+                "|" +
+                bytes_to_b64(data_array.subarray(start, start + chunk_size));
+            }
+
+            show_qr(meta_text);
+            user_message.value = "Starting data transfer in few seconds ...";
+            await sleep(1500);
+
+            // Loop until stopped: a chunk the camera missed comes around
+            // again. After the first pass the order is shuffled so a chunk is
+            // not stuck in the same phase as the camera frame rate.
+            let cycle = 0;
+            while (is_transferring.value) {
+              const order =
+                cycle === 0
+                  ? Array.from({ length: total_chunks }, (_, i) => i)
+                  : shuffled(total_chunks);
+              for (let k = 0; k < order.length; k++) {
+                if (!is_transferring.value) break;
+                if (k % meta_every === 0) {
+                  show_qr(meta_text);
+                  await sleep(1000 / fps.value);
+                }
+                show_qr(frames[order[k]]);
+                user_message.value = `Pass ${cycle + 1}: chunk ${
+                  k + 1
+                }/${total_chunks} (press Stop when receiver is done)`;
+                await sleep(1000 / fps.value);
+              }
+              cycle++;
+            }
+
+            show_qr(idle_message);
+            user_message.value = idle_message;
           };
 
           onMounted(() => {
             console.log("Application Initialized ...");
             let lowest_size =
-              Math.min(window.innerWidth, window.innerHeight) / 1.5;
+              Math.min(window.innerWidth, window.innerHeight) / 1.2;
             qrcode_object = new QRCode("qrcode", {
-              text: "Choose file to get started",
+              text: idle_message,
               width: lowest_size,
               height: lowest_size,
-              typeNumber: 40,
               colorDark: "#000000",
               colorLight: "#ffffff",
-              correctLevel: QRCode.CorrectLevel.M,
+              correctLevel: QRCode.CorrectLevel.L,
             });
           });
 
@@ -116,6 +188,7 @@
             start_transfer,
             stop_transfer,
             is_transferring,
+            fps,
           };
         },
       }).mount("#app");
